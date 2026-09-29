@@ -1,0 +1,597 @@
+# -*- coding: utf-8 -*-
+"""Unit tests for the appointment_sync PLAN decision tree — every branch of
+the runbook, offline. Network readers (_search/_batch_get, field_meta,
+table_id) are monkeypatched with an in-memory fixture Base.
+
+Run:  python -m unittest discover webapp/tests -v
+"""
+import os
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import appointment_sync as sync  # noqa: E402
+import lark_client as lark       # noqa: E402
+
+T31, T56, T54 = "t31", "t56", "t54"   # fixture table ids (VAST -> 5.4)
+
+
+def fake_field_meta(_tid):
+    return {"by_name": {
+        "目的地": {"options": {"1": "YVR2", "2": "YVR4", "3": "YEG1", "4": "YEG2"}},
+        "预约账号": {"options": {"1": "元浩", "2": "BESTAR", "3": "WBLL", "4": "GFL"}},
+    }}
+
+
+def fake_table_id(label):
+    return {"3.1": T31, "5.6": T56, "5.4 VAST-VAN-01": T54,
+            "5.2 BESTAR-CAL": "t52", "5.3 WBLL-EDM": "t53",
+            "5.5 GFL-VAN-02": "t55"}[label]
+
+
+class Fixture:
+    """In-memory stand-in for the three tables the planner reads."""
+
+    def __init__(self):
+        self.rows31 = []       # [{record_id, fields}]
+        self.rows56 = []
+        self.trips = {}        # record_id -> fields
+
+    # ---- plugs for appointment_sync._search / _batch_get -------------------
+    def search(self, table, conditions, field_names, page_size=20):
+        data = {T31: self.rows31, T56: self.rows56}.get(table, [])
+        out = []
+        for rec in data:
+            keep = True
+            for c in conditions:
+                fname, op, val = c["field_name"], c["operator"], c["value"][0]
+                got = rec["fields"].get(fname)
+                got_s = str(got if not isinstance(got, list) else
+                            "".join(x.get("text", "") for x in got))
+                if op == "is" and got_s != val:
+                    keep = False
+                elif op == "contains" and val not in got_s:
+                    keep = False
+            if keep:
+                out.append(rec)
+        return out
+
+    def batch_get(self, table, record_ids, field_names=None):
+        if table == T54:
+            src = self.trips
+            return {rid: dict(src[rid]) for rid in record_ids if rid in src}
+        data = {T31: self.rows31, T56: self.rows56}.get(table, [])
+        by_id = {r["record_id"]: r["fields"] for r in data}
+        return {rid: dict(by_id[rid]) for rid in record_ids if rid in by_id}
+
+
+def make_31(rid="r31a", awb="OOCU9020713B", wh="VAST", dest="YVR2",
+            actual="", est=4.0, boxes=141, plan_links=None):
+    f = {"柜号/AWB": [{"text": awb}], "仓库供应商": wh, "目的地路线": dest,
+         "实际板数": ([{"text": actual}] if actual else None),
+         "预计板数": {"type": 2, "value": [est]} if est is not None else None,
+         "箱数": boxes, "客户批次号": [{"text": "B-1"}], "派送计划": None}
+    if plan_links:
+        f["5.4 VAST-VAN-01"] = {"link_record_ids": plan_links}
+    return {"record_id": rid, "fields": {k: v for k, v in f.items() if v is not None}}
+
+
+def make_56(rid="r56a", isa=7403350996, time="2026/07/30 13:00", dest="YVR2",
+            account="元浩", trip_links=None):
+    f = {"ISA": isa, "复制时间列": [{"text": time}], "目的地": dest, "预约账号": account}
+    if trip_links:
+        f["5.4 出库计划 温哥华"] = {"link_record_ids": trip_links}
+    return {"record_id": rid, "fields": f}
+
+
+def make_trip(inv_ids=(), isa_ids=()):
+    return {"预约信息": {"link_record_ids": list(isa_ids)},
+            "库存信息-元浩": {"link_record_ids": list(inv_ids)}}
+
+
+LINE_BASIC = "OOCU9020713B YVR2 4 141"
+LINE_FULL = "OOCU9020713B YVR2 4 141 7403350996 07/30/2026 13:00 PDT"
+
+
+class PlannerCase(unittest.TestCase):
+    def setUp(self):
+        self.fx = Fixture()
+        self.patches = [
+            mock.patch.object(sync, "_search", self.fx.search),
+            mock.patch.object(sync, "_batch_get", self.fx.batch_get),
+            mock.patch.object(lark, "field_meta", fake_field_meta),
+            mock.patch.object(lark, "table_id", fake_table_id),
+            mock.patch.object(lark, "ENV", "prod"),   # prod field names in fixtures
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+        sync._RECENT_TRIPS.clear()          # per-test 1-to-1 registry
+        self.addCleanup(sync._RECENT_TRIPS.clear)
+
+    def plan1(self, line, warehouse="VAST"):
+        r = sync.plan(warehouse, line)
+        return r["rows"][0]
+
+    def action_types(self, row):
+        return [a["type"] for a in row["actions"]]
+
+
+class TestStep2Matching(PlannerCase):
+    def test_no_match(self):
+        row = self.plan1(LINE_BASIC)
+        self.assertIn("无匹配", row["match_error"])
+
+    def test_ambiguous_when_numbers_cannot_distinguish(self):
+        # identical 箱数 AND both 实际板数 empty -> genuinely ambiguous, refuse
+        self.fx.rows31 = [make_31("a"), make_31("b")]
+        row = self.plan1(LINE_BASIC)
+        self.assertIn("2 行", row["match_error"])
+        self.assertIn("无法按箱数/板数区分", row["match_error"])
+
+    def test_split_rows_disambiguated_by_boxes(self):
+        # split shipment: same 柜号+路线, boxes 706 vs 0 tell them apart
+        self.fx.rows31 = [make_31("a", boxes=706),
+                          make_31("b", boxes=0)]
+        row = self.plan1("OOCU9020713B YVR2 23 0")
+        self.assertIsNone(row["match_error"])
+        self.assertEqual(row["match"]["record_id"], "b")
+        self.assertTrue(any("已按箱数精确匹配" in n for n in row["notes"]))
+        row = self.plan1("OOCU9020713B YVR2 8 706")
+        self.assertEqual(row["match"]["record_id"], "a")
+
+    def test_split_rows_boxes_tie_broken_by_actual_pallets(self):
+        # 箱数 identical -> the provided 板数 vs the Feishu 实际板数 column
+        # decides (operator-specified; NOT 预计板数)
+        self.fx.rows31 = [make_31("a", boxes=100, actual="8"),
+                          make_31("b", boxes=100, actual="23")]
+        row = self.plan1("OOCU9020713B YVR2 23 100")
+        self.assertIsNone(row["match_error"])
+        self.assertEqual(row["match"]["record_id"], "b")
+        self.assertTrue(any("箱数+板数" in n for n in row["notes"]))
+
+    def test_boxes_tie_with_empty_actuals_stays_ambiguous(self):
+        # 箱数 identical and 实际板数 both empty -> nothing to compare, refuse
+        self.fx.rows31 = [make_31("a", boxes=100), make_31("b", boxes=100)]
+        row = self.plan1("OOCU9020713B YVR2 23 100")
+        self.assertIn("无法按箱数/板数区分", row["match_error"])
+
+    def test_boxes_matching_no_row_stays_ambiguous(self):
+        # the line's 箱数 matches NEITHER candidate -> never guess
+        self.fx.rows31 = [make_31("a", boxes=706), make_31("b", boxes=0)]
+        row = self.plan1("OOCU9020713B YVR2 4 555")
+        self.assertIn("无法按箱数/板数区分", row["match_error"])
+
+    def test_two_lines_two_rows_matched_separately(self):
+        # the user's split-shipment case: both lines plan, on DIFFERENT rows
+        self.fx.rows31 = [make_31("a", boxes=706),
+                          make_31("b", boxes=0)]
+        r = sync.plan("VAST", "OOCU9020713B YVR2 8 706\nOOCU9020713B YVR2 23 0")
+        rids = [row["match"]["record_id"] for row in r["rows"]]
+        self.assertEqual(rids, ["a", "b"])
+        self.assertTrue(all(not row["blockers"] for row in r["rows"]))
+
+    def test_two_lines_same_record_both_blocked(self):
+        # numbers land both lines on ONE record -> refuse both, no winner
+        self.fx.rows31 = [make_31("a", boxes=706)]
+        r = sync.plan("VAST", "OOCU9020713B YVR2 8 706\nOOCU9020713B YVR2 8 706")
+        for row in r["rows"]:
+            self.assertTrue(any("同一条 3.1 记录" in b for b in row["blockers"]),
+                            str(row["blockers"]))
+        # blocked rows are not approvable -> commit would skip them
+        self.assertEqual(r["summary"]["actionable"], 0)
+
+    def test_suffix_fallback(self):
+        # stored as …713BA (one extra char) — search input …713B still matches
+        self.fx.rows31 = [make_31(awb="OOCU9020713BA")]
+        row = self.plan1(LINE_BASIC)
+        self.assertIsNone(row["match_error"])
+        self.assertEqual(row["match"]["awb"], "OOCU9020713BA")
+
+    def test_merged_container_not_mismatched(self):
+        # a longer, different container must NOT match via the fallback
+        self.fx.rows31 = [make_31(awb="OOCU9020713BXX")]
+        row = self.plan1(LINE_BASIC)
+        self.assertIn("无匹配", row["match_error"])
+
+
+class TestStep3Pallets(PlannerCase):
+    def test_empty_filled(self):
+        self.fx.rows31 = [make_31(actual="", est=4.0)]
+        row = self.plan1(LINE_BASIC)
+        self.assertIn("fill_pallets", self.action_types(row))
+        self.assertFalse([w for w in row["warnings"] if w.startswith("W1")])
+
+    def test_empty_filled_with_w1(self):
+        self.fx.rows31 = [make_31(actual="", est=9.0)]   # |4-9| = 5 > 2
+        row = self.plan1(LINE_BASIC)
+        self.assertIn("fill_pallets", self.action_types(row))
+        self.assertTrue([w for w in row["warnings"] if w.startswith("W1")])
+
+    def test_occupied_never_overwritten(self):
+        self.fx.rows31 = [make_31(actual="7", est=9.0)]  # |4-9| > 2 AND occupied
+        row = self.plan1(LINE_BASIC)
+        self.assertNotIn("fill_pallets", self.action_types(row))
+        w2 = [w for w in row["warnings"] if w.startswith("W2")]
+        self.assertTrue(w2)
+        self.assertIn("未覆盖", w2[0])
+
+    def test_occupied_small_diff_no_warning(self):
+        self.fx.rows31 = [make_31(actual="5", est=4.0)]  # diff 0 vs est... |4-4|
+        row = self.plan1(LINE_BASIC)
+        self.assertNotIn("fill_pallets", self.action_types(row))
+        self.assertFalse([w for w in row["warnings"] if w.startswith("W2")])
+
+    def test_boundary_diff_exactly_2_no_warning(self):
+        self.fx.rows31 = [make_31(actual="", est=6.0)]   # |4-6| == 2, not > 2
+        row = self.plan1(LINE_BASIC)
+        self.assertFalse([w for w in row["warnings"] if w.startswith("W1")])
+
+    def test_box_mismatch_warns(self):
+        self.fx.rows31 = [make_31(boxes=999)]
+        row = self.plan1(LINE_BASIC)
+        self.assertTrue([w for w in row["warnings"] if "箱数不一致" in w])
+
+
+class TestStep4APlanExists(PlannerCase):
+    def _wire(self, isa=7403350996, time="2026/07/30 13:00", inv=("r31a",),
+              actual="4"):
+        # 实际板数 already "4" so the pallet step plans NOTHING — these tests
+        # isolate the PLAN-wiring branch.
+        self.fx.rows31 = [make_31(actual=actual, plan_links=["trip1"])]
+        self.fx.rows56 = [make_56(isa=isa, time=time, trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(inv_ids=inv, isa_ids=["r56a"])
+
+    def test_match_does_nothing(self):
+        self._wire()
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "has_plan_match")
+        self.assertEqual(row["actions"], [])
+
+    def test_isa_mismatch_updates_linked_56(self):
+        self._wire(isa=1111111111)
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "has_plan_mismatch")
+        acts = [a for a in row["actions"] if a["type"] == "update_isa_time"]
+        self.assertEqual(len(acts), 1)
+        self.assertEqual(acts[0]["isa_record_id"], "r56a")   # EDIT THE LINKED record
+        self.assertEqual(acts[0]["isa"], 7403350996)
+        self.assertEqual(acts[0]["time"], "2026/07/30 13:00")
+
+    def test_time_mismatch_updates(self):
+        self._wire(time="2026/07/30 15:00")
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "has_plan_mismatch")
+
+    def test_time_format_variants_still_match(self):
+        # stored year-first vs pasted month-first must compare EQUAL
+        self._wire(time="2026/7/30 13:00")
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "has_plan_match")
+
+    def test_no_isa_provided_display_only(self):
+        self._wire()
+        row = self.plan1(LINE_BASIC)
+        self.assertEqual(row["plan"]["status"], "has_plan")
+        self.assertEqual(row["actions"], [])   # occupied pallets + no ISA -> nothing
+
+    def test_no_isa_but_empty_pallets_still_fills(self):
+        # 4-token mode never touches the plan, but the 板数 fill STILL happens.
+        self._wire(actual="")
+        row = self.plan1(LINE_BASIC)
+        self.assertEqual(row["plan"]["status"], "has_plan")
+        self.assertEqual([a["type"] for a in row["actions"]], ["fill_pallets"])
+
+    def test_w3_overflow_on_existing_plan(self):
+        others = [make_31(f"r31x{i}", awb=f"X{i}", actual="10") for i in range(3)]
+        self.fx.rows31 = [make_31(plan_links=["trip1"])] + others
+        self.fx.rows56 = [make_56(trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(
+            inv_ids=["r31a"] + [o["record_id"] for o in others], isa_ids=["r56a"])
+        row = self.plan1(LINE_FULL)   # 4 + 30 = 34 > 28
+        self.assertTrue([w for w in row["warnings"] if w.startswith("W3")])
+
+
+class TestStep4BNoPlan(PlannerCase):
+    def test_no_isa_no_action(self):
+        self.fx.rows31 = [make_31(actual="4")]
+        row = self.plan1(LINE_BASIC)
+        self.assertEqual(row["plan"]["status"], "no_plan")
+        self.assertEqual(row["actions"], [])
+
+    def test_isa_with_trip_links_shipment(self):
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56(trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(inv_ids=[], isa_ids=["r56a"])
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "link_existing")
+        acts = [a for a in row["actions"] if a["type"] == "link_trip"]
+        self.assertEqual(acts[0]["trip_id"], "trip1")
+        self.assertEqual(acts[0]["plan_link_field"], "5.4 VAST-VAN-01")
+
+    def test_isa_with_trip_overflow_warns(self):
+        others = [make_31(f"r31x{i}", awb=f"X{i}", actual="9") for i in range(3)]
+        self.fx.rows31 = [make_31()] + others
+        self.fx.rows56 = [make_56(trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(
+            inv_ids=[o["record_id"] for o in others], isa_ids=["r56a"])
+        row = self.plan1(LINE_FULL)   # 27 existing + 4 = 31 > 28
+        self.assertTrue([w for w in row["warnings"] if w.startswith("W3")])
+
+    def test_isa_without_trip_creates_trip(self):
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56()]                      # no trip links
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "create_trip")
+        self.assertEqual(self.action_types(row).count("create_trip"), 1)
+        self.assertIn("link_trip", self.action_types(row))
+        self.assertNotIn("create_isa", self.action_types(row))
+
+    def test_time_refresh_on_existing_isa(self):
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56(time="2026/07/30 15:00")]   # stored differs
+        row = self.plan1(LINE_FULL)
+        self.assertIn("update_isa_time", self.action_types(row))
+
+    def test_isa_missing_is_blocked_not_created(self):
+        """②计划同步 never creates 5.6 records — a missing ISA blocks the row
+        and points at ①新建预约 (single-writer ownership)."""
+        self.fx.rows31 = [make_31()]
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["plan"]["status"], "isa_missing")
+        # the pallet fill was already queued by step 3, but the blocker means
+        # commit() skips the ENTIRE row — nothing is written until ① runs
+        self.assertEqual(self.action_types(row), ["fill_pallets"])
+        self.assertTrue(row["blockers"])
+        self.assertIn("①新建预约", row["blockers"][0])
+        self.assertIn("7403350996", row["blockers"][0])
+
+    def test_no_create_isa_action_exists_at_all(self):
+        # guards against the overlap regressing: the action type is gone
+        self.fx.rows31 = [make_31()]
+        for line in (LINE_FULL, "OOCU9020713B YVR9 4 141 7403350996 07/30/2026 13:00"):
+            row = self.plan1(line)
+            self.assertNotIn("create_isa", self.action_types(row))
+
+    def test_new_isa_existing_elsewhere_relinks_trip(self):
+        """4A mismatch, pasted ISA lives on ANOTHER 5.6 record (newest-wins,
+        operator-specified 2026-08-05): RELINK the 出库计划's 预约信息 to that
+        record instead of rewriting the linked one (which would duplicate the
+        ISA — the old behavior blocked here). Target's stored time differs
+        from the paste -> its 复制时间列 is updated too."""
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 15:00"),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)          # pastes 7403350996 @ 07/30 13:00
+        self.assertEqual(row["plan"]["status"], "has_plan_mismatch")
+        self.assertEqual(row["blockers"], [])
+        relink = next(a for a in row["actions"] if a["type"] == "set_trip_isa")
+        self.assertEqual(relink["mode"], "relink")
+        self.assertEqual(relink["trip_id"], "trip1")
+        self.assertEqual(relink["isa_record_id"], "other")
+        upd = next(a for a in row["actions"] if a["type"] == "update_isa_time")
+        self.assertEqual(upd["isa_record_id"], "other")     # target, NOT linked
+        self.assertEqual(upd["time"], "2026/07/30 13:00")
+        self.assertTrue(any("改挂" in w for w in row["warnings"]))
+
+    def test_new_isa_with_existing_plan_moves_row_not_trip(self):
+        """1-to-1 invariant (2026-08-05): when the target appointment ALREADY
+        has a 出库计划, the 3.1 row moves onto it — the old trip is NOT
+        repointed (that would give the target two plans)."""
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 13:00",
+                    trip_links=["trip2"]),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        self.fx.trips["trip2"] = make_trip(inv_ids=[], isa_ids=["other"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertNotIn("set_trip_isa", types)          # no repoint
+        self.assertNotIn("create_trip", types)           # no second plan
+        move = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(move["trip_id"], "trip2")
+        self.assertTrue(move.get("replace"))
+        self.assertTrue(any("移挂" in w for w in row["warnings"]))
+
+    def test_new_isa_no_plan_but_shared_old_trip_creates_target_plan(self):
+        # old 出库计划 carries ANOTHER shipment too -> repointing it would
+        # drag that shipment along; instead the target gets its own ONE plan
+        # and only this row moves
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 13:00"),
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a", "r31z"],
+                                           isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertNotIn("set_trip_isa", types)
+        create = next(a for a in row["actions"] if a["type"] == "create_trip")
+        self.assertEqual(create["isa_record_id"], "other")   # the TARGET appt
+        move = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(move["trip_id"], "@group")
+        self.assertTrue(move.get("replace"))
+
+    def test_legacy_multi_plan_joins_dominant_trip(self):
+        """Legacy duplicates are NOT repaired (operator decision 2026-08-14),
+        but new shipments must consolidate onto the trip carrying the most
+        shipments — never onto an empty duplicate — so the tangle can't grow."""
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56("appt", isa=7403350996,
+                                  trip_links=["tEmpty", "tBusy"])]
+        self.fx.trips["tEmpty"] = make_trip(inv_ids=[], isa_ids=["appt"])
+        self.fx.trips["tBusy"] = make_trip(inv_ids=["x1", "x2", "x3"],
+                                           isa_ids=["appt"])
+        row = self.plan1(LINE_FULL)
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(link["trip_id"], "tBusy")       # dominant, not first
+        self.assertNotIn("create_trip", self.action_types(row))
+        self.assertTrue(any("历史遗留" in w for w in row["warnings"]),
+                        str(row["warnings"]))
+
+    def test_recent_trip_registry_defeats_search_lag(self):
+        """A plan created moments ago (previous batch) must be found even
+        while the 5.6 search index still shows no link — otherwise a second
+        plan gets created for the same appointment (operator-reported)."""
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56("appt", isa=7403350996)]   # link NOT visible
+        sync._recent_trip_put("appt", "5.4 VAST-VAN-01", "tripX")
+        self.fx.trips["tripX"] = make_trip(inv_ids=[], isa_ids=["appt"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertNotIn("create_trip", types)               # no duplicate
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(link["trip_id"], "tripX")           # joins via registry
+
+    def test_relink_without_time_update_when_target_time_matches(self):
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [
+            make_56("linked", isa=1111111111, trip_links=["trip1"]),
+            make_56("other", isa=7403350996, time="2026/07/30 13:00"),  # matches paste
+        ]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)
+        types = self.action_types(row)
+        self.assertIn("set_trip_isa", types)
+        self.assertNotIn("update_isa_time", types)   # nothing to change on target
+
+    def test_isa_rewrite_allowed_when_target_isa_is_new(self):
+        # same shape, but the pasted ISA exists nowhere -> in-place reschedule
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [make_56("linked", isa=1111111111, trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["blockers"], [])
+        self.assertIn("update_isa_time", self.action_types(row))
+        self.assertTrue(any("ISA 号将被改写" in w for w in row["warnings"]))
+
+    def test_time_only_mismatch_needs_no_isa_guard(self):
+        # ISA matches, only the time differs -> plain update, no blocker
+        self.fx.rows31 = [make_31(actual="4", plan_links=["trip1"])]
+        self.fx.rows56 = [make_56("linked", isa=7403350996,
+                                  time="2026/07/30 15:00", trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(inv_ids=["r31a"], isa_ids=["linked"])
+        row = self.plan1(LINE_FULL)
+        self.assertEqual(row["blockers"], [])
+        self.assertIn("update_isa_time", self.action_types(row))
+        self.assertFalse(any("ISA 号将被改写" in w for w in row["warnings"]))
+
+    def test_account_mismatch_warns(self):
+        self.fx.rows31 = [make_31()]
+        self.fx.rows56 = [make_56(account="BESTAR", trip_links=["trip1"])]
+        self.fx.trips["trip1"] = make_trip(isa_ids=["r56a"])
+        row = self.plan1(LINE_FULL)
+        self.assertTrue([w for w in row["warnings"] if "预约账号" in w])
+
+
+class TestGroupsAndWarehouses(PlannerCase):
+    def test_group_time_conflict_blocks(self):
+        self.fx.rows31 = [make_31("a"), make_31("b", awb="TCNU4251020B", dest="YVR4")]
+        text = ("OOCU9020713B YVR2 4 141 7403350996 07/30/2026 13:00\n"
+                "TCNU4251020B YVR4 1 4 7403350996 07/30/2026 15:00")
+        r = sync.plan("VAST", text)
+        self.assertTrue(all(row["blockers"] for row in r["rows"]))
+
+    def test_group_shares_one_trip_create(self):
+        self.fx.rows31 = [make_31("a"), make_31("b", awb="TCNU4251020B", dest="YVR2")]
+        self.fx.rows56 = [make_56()]        # the appointment ALREADY exists (①)
+        text = ("OOCU9020713B YVR2 4 141 7403350996 07/30/2026 13:00\n"
+                "TCNU4251020B YVR2 1 4 7403350996 07/30/2026 13:00")
+        r = sync.plan("VAST", text)
+        # both rows plan create_trip for the SAME group; commit materializes
+        # exactly one 出库计划 (deduped by group_isa)
+        for row in r["rows"]:
+            self.assertIn("create_trip", [a["type"] for a in row["actions"]])
+            self.assertEqual(row["plan"]["status"], "create_trip")
+
+    def test_group_cap_warning_new_trip(self):
+        self.fx.rows31 = [make_31("a"), make_31("b", awb="TCNU4251020B", dest="YVR2")]
+        self.fx.rows56 = [make_56()]        # appointment exists
+        text = ("OOCU9020713B YVR2 20 141 7403350996 07/30/2026 13:00\n"
+                "TCNU4251020B YVR2 15 4 7403350996 07/30/2026 13:00")   # 35 > 28
+        r = sync.plan("VAST", text)
+        self.assertTrue(any(w.startswith("W3") for row in r["rows"] for w in row["warnings"]))
+
+    def test_tor_1140_pallets_only(self):
+        self.fx.rows31 = [make_31(wh="TOR-1140", dest="YEG2")]
+        row = self.plan1("OOCU9020713B YEG2 4 141", warehouse="TOR-1140")
+        self.assertEqual(row["plan"]["status"], "no_plan_table")
+        self.assertEqual(self.action_types(row), ["fill_pallets"])
+
+    def test_cal_5505_routes_to_bestar(self):
+        self.assertEqual(sync.WAREHOUSES["CAL-5505"]["plan_table"], "5.2 BESTAR-CAL")
+        self.assertEqual(sync.WAREHOUSES["CAL-5505"]["account"], "BESTAR")
+
+    def test_unknown_warehouse_raises(self):
+        with self.assertRaises(lark.LarkError):
+            sync.plan("NOPE", LINE_BASIC)
+
+    def test_sig_stable_and_change_detected(self):
+        self.fx.rows31 = [make_31(actual="", est=4.0)]
+        r1 = self.plan1(LINE_BASIC)
+        r2 = self.plan1(LINE_BASIC)
+        self.assertEqual(r1["sig"], r2["sig"])
+        self.fx.rows31 = [make_31(actual="4", est=4.0)]   # someone filled it
+        r3 = self.plan1(LINE_BASIC)
+        self.assertNotEqual(r1["sig"], r3["sig"])
+
+
+class TestDevWiring(PlannerCase):
+    """LARK_ENV=dev field-name resolution (real config.js values)."""
+
+    def setUp(self):
+        super().setUp()
+        self.env_patch = mock.patch.object(lark, "ENV", "dev")
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def test_bestar_uses_dev_columns(self):
+        w = sync._env_wiring("5.2 BESTAR-CAL")
+        self.assertTrue(w["enabled"])
+        self.assertEqual(w["plan_link_31"],
+                         "5.2 BESTAR-CAL-P-01 副本-3.1 库存总表 副本-5.2 BESTAR-CAL")
+        self.assertEqual(w["link_on_56"],
+                         "5.2 BESTAR-CAL-P-01 副本-5.6 预约表 副本-5.2 出库计划 卡尔加里")
+        self.assertEqual(w["isa_field"], "5.6 预约表 副本-5.2 出库计划 卡尔加里")
+        self.assertEqual(w["inv_field"], "3.1 库存总表 副本-5.2 BESTAR-CAL")
+
+    def test_warehouse_without_dev_copy_disabled(self):
+        # VAST has no dev 5.4 copy: trips OFF in dev, pallet fill still planned
+        self.assertFalse(sync._env_wiring("5.4 VAST-VAN-01")["enabled"])
+        self.fx.rows31 = [make_31()]     # empty 实际板数
+        row = self.plan1(LINE_FULL)      # ISA+time provided
+        self.assertEqual(row["plan"]["status"], "no_dev_plan_table")
+        self.assertEqual([a["type"] for a in row["actions"]], ["fill_pallets"])
+
+    def test_dev_bestar_plans_dev_link_field(self):
+        self.fx.rows31 = [make_31(wh="BESTAR", dest="YEG2")]
+        # the appointment must already exist (created by ①) for ② to wire it
+        self.fx.rows56 = [make_56(isa=9903350996, dest="YEG2", account="BESTAR")]
+        r = sync.plan("BESTAR",
+                      "OOCU9020713B YEG2 4 141 9903350996 07/30/2026 13:00")
+        row = r["rows"][0]
+        link = next(a for a in row["actions"] if a["type"] == "link_trip")
+        self.assertEqual(link["plan_link_field"],
+                         "5.2 BESTAR-CAL-P-01 副本-3.1 库存总表 副本-5.2 BESTAR-CAL")
+
+    def test_prod_wiring_unchanged(self):
+        self.env_patch.stop()            # back to prod for this one
+        try:
+            w = sync._env_wiring("5.2 BESTAR-CAL")
+            self.assertEqual(w["plan_link_31"], "5.2 BESTAR-CAL")
+            self.assertEqual(w["link_on_56"], "5.2 出库计划 卡尔加里")
+            self.assertEqual(w["isa_field"], "预约信息")
+            self.assertEqual(w["inv_field"], "库存信息-卡尔加里")
+        finally:
+            self.env_patch.start()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,22 @@
+{
+  "name": "lark-tunnel",
+  "version": "0.1.0",
+  "description": "Batch-command tooling and wrapper library for a production Lark (Feishu) Base — warehouse appointment & delivery-plan workflow.",
+  "main": "src/lark/index.js",
+  "scripts": {
+    "verify:config": "node scripts/verify-config.js",
+    "import:inventory": "node src/workflow/create-inventory-records.js",
+    "test": "python -m unittest discover webapp/tests",
+    "test:integration": "python webapp/tests/integration_dev.py",
+    "test:create56": "python webapp/tests/integration_create56.py",
+    "test:workflow": "python webapp/tests/integration_workflow.py",
+    "test:split": "python webapp/tests/integration_split.py"
+  },
+  "keywords": ["lark", "feishu", "bitable", "warehouse", "automation"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}

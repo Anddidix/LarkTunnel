@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LarkTunnel · 到仓核对台</title>
+  <!-- Stamp the theme BEFORE first paint so a dark-mode user never sees a
+       white flash. Mirrors applyTheme() in app.js; localStorage key larkTheme
+       holds 'auto' | 'light' | 'dark'. -->
+  <script>
+    try {
+      var m = localStorage.getItem("larkTheme") || "auto";
+      var dark = m === "dark" || (m === "auto"
+        && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      document.documentElement.dataset.theme = dark ? "dark" : "light";
+    } catch (e) { document.documentElement.dataset.theme = "light"; }
+  </script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🚇 <b>LarkTunnel</b> <span>到仓核对台</span>
+      <span id="envBadge" class="envbadge" hidden></span>
+    </div>
+    <div class="topright">
+      <span class="hint"><span id="tzNote">—</span></span>
+      <button id="themeBtn" class="themebtn" type="button"
+              title="切换主题：自动 / 浅色 / 深色">🌗 自动</button>
+    </div>
+  </header>
+
+  <!-- Tab order == the operator's workflow order. Exactly ONE tab writes
+       each table: 📦 CREATES 3.1 records (import only, never updates)
+       · ① creates 5.6 · ② wires 3.1/出库计划 (+updates linked 5.6)
+       · ③ reads only · 查询/解析 read only. -->
+  <nav class="tabs" id="tabs">
+    <button data-tab="import">📦 库存导入</button>
+    <button data-tab="create" class="on">① 新建预约</button>
+    <button data-tab="sync">② 计划同步</button>
+    <button data-tab="verify">③ 核对</button>
+    <button data-tab="audit">🗑️ 删除日志</button>
+    <button data-tab="query">🔍 库存查询</button>
+    <button data-tab="upload">📄 文件解析</button>
+  </nav>
+
+  <main class="wrap">
+    <!-- shared job progress — visible from ANY tab while plan/commit runs -->
+    <section id="syncProgress" class="progresspanel" hidden>
+      <div class="prowhead">
+        <span class="spinner"></span>
+        <b id="progStage">—</b>
+        <span id="progCount" class="progcount"></span>
+        <span id="progElapsed" class="progelapsed"></span>
+      </div>
+      <div class="pbar"><div id="progFill" class="pbar-fill"></div></div>
+      <div id="progCurrent" class="progcurrent"></div>
+    </section>
+
+    <!-- ═══════════════ 📦 库存导入（收货派送计划 → 3.1 新建记录） ═══════════════ -->
+    <section id="tab-import" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">写入 3.1 仓库供应商 字段（按 3.1 现有选项校验）</span></div>
+        <div class="seg wh" id="whSegImp"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTipImp"></div>
+
+        <div class="ownnote">本页<b>只新建</b> 3.1 库存记录：解析收货派送计划 Excel，
+          按<b>目的地路线汇总</b>箱数/重量/体积，每条路线一条记录。不修改任何已有记录 —
+          同柜号同路线已存在时自动跳过。</div>
+
+        <div class="stephead mt"><b>2 · 上传收货派送计划</b>
+          <span class="stepnote">自动选择数据工作表、识别表头、展开合并单元格；
+            汇总行自动剔除</span></div>
+        <div id="dropImp" class="drop">
+          <input id="fileImp" type="file" accept=".xlsx,.xlsm" hidden />
+          <div class="dropinner">
+            <span class="big">把 .xlsx 拖到这里</span>
+            <span class="or">或</span>
+            <button id="pickImpBtn" class="primary">选择文件</button>
+            <span class="fmt" id="impFileNote">支持 .xlsx / .xlsm</span>
+          </div>
+        </div>
+
+        <div class="stephead mt"><b>3 · 公共字段</b>
+          <span class="stepnote">写入每条记录：柜号从文件名自动识别，可修改</span></div>
+        <div class="grid">
+          <label class="fld grow"><span>柜号 / AWB</span>
+            <input id="impAwb" type="text" placeholder="例如 BEAU6279991" autocomplete="off" /></label>
+          <label class="fld grow"><span>客户批次号</span>
+            <input id="impBatch" type="text" placeholder="例如 2026-LY-618" autocomplete="off" /></label>
+        </div>
+
+        <div class="syncgo">
+          <button id="impPlanBtn" class="primary" disabled>解析并预检（只读）</button>
+          <span class="tip" id="impGoTip">选择仓库、上传文件并填写公共字段后可预检</span>
+        </div>
+      </section>
+
+      <section id="impStatus" class="status" hidden></section>
+      <section id="impResults" class="results"></section>
+
+      <div class="execbar" id="impExecBar" hidden>
+        <label class="chkall"><input type="checkbox" id="chkAllImp" checked /> 全选待新建行</label>
+        <button id="impExecBtn" class="primary danger" disabled>创建选中记录</button>
+        <span class="tip" id="impExecTip"></span>
+      </div>
+
+      <section id="impWarnings" class="warnpanel" hidden></section>
+    </section>
+
+    <!-- ═══════════════ ② 计划同步（3.1 板数 + 出库计划接线） ═══════════════ -->
+    <section id="tab-sync" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">决定 3.1 匹配条件、预约账号与出库计划表</span></div>
+        <div class="seg wh" id="whSeg"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTip"></div>
+
+        <div class="ownnote">本页<b>只写</b> 3.1 实际板数 与 出库计划关联；预约（5.6）
+          必须先在「① 新建预约」创建 —— 不存在的 ISA 会被拦截，不会在这里新建。</div>
+
+        <div class="stephead mt"><b>2 · 粘贴到仓明细</b>
+          <span class="stepnote">每行一票：柜号 → 路线 → 实际板数 → 箱数（可选再加 ISA + 预约时间）。
+            直接从 Excel 复制即可，制表符/空格均可。</span></div>
+        <textarea id="syncInput" rows="7" spellcheck="false"
+          placeholder="OOCU9020713B&#9;YEG2&#9;4&#9;141
+TCNU4251020B&#9;YEG1&#9;1&#9;4
+CXDU2185835&#9;YEG2&#9;2&#9;135&#9;147204024984&#9;07/27/2026 08:00 MDT"></textarea>
+        <div id="syncLines" class="linelist"></div>
+
+        <div class="syncgo">
+          <button id="syncPlanBtn" class="primary" disabled>查询并预检（只读）</button>
+          <span class="tip" id="syncGoTip">选择仓库并粘贴明细后可查询</span>
+        </div>
+      </section>
+
+      <section id="syncStatus" class="status" hidden></section>
+      <section id="syncResults" class="results"></section>
+
+      <div class="execbar" id="execBar" hidden>
+        <label class="chkall"><input type="checkbox" id="chkAll" checked /> 全选可执行行</label>
+        <button id="syncExecBtn" class="primary danger" disabled>执行选中更新</button>
+        <span class="tip" id="execTip"></span>
+      </div>
+
+      <section id="syncWarnings" class="warnpanel" hidden></section>
+    </section>
+
+    <!-- ═══════════════ ① 新建预约（仅 5.6） ═══════════════ -->
+    <section id="tab-create" class="tabpane">
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">决定写入 5.6 的预约账号（VAST→元浩 等映射自动处理）</span></div>
+        <div class="seg wh" id="whSeg56"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTip56"></div>
+
+        <div class="ownnote">本页是<b>唯一</b>创建 5.6 预约记录的入口。不改 3.1、
+          不建出库计划、也不修改已存在的预约（改时间请到「② 计划同步」）。</div>
+
+        <div class="stephead mt"><b>2 · 粘贴预约明细</b>
+          <span class="stepnote">每行一条：目的地 → ISA → 预约时间。只新建 5.6 里不存在的
+            ISA，已存在的自动跳过。</span></div>
+        <textarea id="createInput" rows="6" spellcheck="false"
+          placeholder="YVR4&#9;7405010996&#9;08/06/2026 20:00 PDT
+YEG1&#9;7229872996&#9;08/07/2026 08:00 MDT
+YEG2&#9;147683024984&#9;08/05/2026 19:00 MDT"></textarea>
+        <div id="createLines" class="linelist"></div>
+
+        <div class="syncgo">
+          <button id="createPlanBtn" class="primary" disabled>查询并预检（只读）</button>
+          <span class="tip" id="createGoTip">选择仓库并粘贴明细后可查询</span>
+        </div>
+      </section>
+
+      <section id="createStatus" class="status" hidden></section>
+      <section id="createResults" class="results"></section>
+
+      <div class="execbar" id="createExecBar" hidden>
+        <button id="createExecBtn" class="primary danger" disabled>创建缺失的预约</button>
+        <span class="tip" id="createExecTip"></span>
+      </div>
+
+      <section id="createWarnings" class="warnpanel" hidden></section>
+    </section>
+
+    <!-- ═══════════════ ③ 核对（只读：3.1 → 出库计划 → 预约） ═══════════════ -->
+    <section id="tab-verify" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>1 · 选择仓库供应商</b>
+          <span class="stepnote">决定 3.1 匹配条件与应有的预约账号</span></div>
+        <div class="seg wh" id="whSegV"><!-- populated from /api/sync/meta --></div>
+        <div class="tip" id="whTipV"></div>
+
+        <div class="ownnote">本页<b>完全只读</b>，不做任何写入。沿着
+          3.1 → 出库计划 → 预约 逐层跟踪，确认预约挂到了正确的库存行。</div>
+
+        <div class="stephead mt"><b>2 · 粘贴要核对的柜号</b>
+          <span class="stepnote">每行一个柜号即可；也可以直接把「② 计划同步」那批明细整段粘进来 —
+            多出来的路线 / ISA / 时间会作为<b>期望值</b>参与比对。</span></div>
+        <textarea id="verifyInput" rows="6" spellcheck="false"
+          placeholder="ZCSU9034790B
+或整段粘贴（带期望值）：
+ZCSU9034790B&#9;YVR4&#9;1&#9;14&#9;7404870996&#9;08/03/2026 13:00 PDT"></textarea>
+
+        <div class="syncgo">
+          <button id="verifyBtn" class="primary" disabled>开始核对（只读）</button>
+          <span class="tip" id="verifyGoTip">选择仓库并粘贴柜号后可核对</span>
+        </div>
+      </section>
+
+      <section id="verifyStatus" class="status" hidden></section>
+      <section id="verifyResults" class="results"></section>
+    </section>
+
+    <!-- ═══════════════ 🗑️ 删除日志（只读：本地审计库检索） ═══════════════ -->
+    <section id="tab-audit" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="stephead"><b>🗑️ 记录变更审计</b>
+          <span class="stepnote">监听器（tools/deletion-watcher）把 记录删除/新增
+            事件连同字段内容存入本地库 — 记录即使已从表中消失，也能按字段值搜到</span></div>
+        <div class="ownnote" id="auditStatusNote">正在读取监听器状态…</div>
+
+        <div class="grid">
+          <label class="fld grow"><span>关键字（柜号 / 批次号 / 路线 / 任意字段值，空格 = 且）</span>
+            <input id="auditQ" type="text" placeholder="例如 BEAU6279991 或 YVR4 2026-LY" autocomplete="off" /></label>
+          <label class="fld"><span>动作</span>
+            <div class="seg" id="auditActSeg">
+              <button data-a="record_deleted" class="on">删除</button>
+              <button data-a="record_added">新增</button>
+              <button data-a="all">全部</button>
+            </div></label>
+          <label class="fld"><span>表</span>
+            <select id="auditTable"><option value="">全部表</option></select></label>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditGoBtn" class="primary">搜索</button></div>
+        </div>
+        <div class="tip">完全只读 — 检索本地审计库，不访问飞书数据表。被删记录的完整字段
+          值在结果行里展开查看。</div>
+
+        <div class="syncgo">
+          <button id="auditHarvestBtn" class="mini">🔄 采集操作人名单</button>
+          <span class="tip" id="auditHarvestTip">扫描各表 创建人/最后修改人（只读）自动建立
+            open_id → 姓名 对照（config/operators-auto.json，无需人工维护）</span>
+        </div>
+
+        <div class="grid">
+          <label class="fld grow"><span>ID 解析（粘贴 opt… / fld… / tbl… / ou_… 得到可读文本）</span>
+            <input id="auditResolveIn" type="text" placeholder="例如 optr3cyl6e" autocomplete="off" /></label>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditResolveBtn" class="mini">解析</button></div>
+        </div>
+        <div class="tip" id="auditResolveOut"></div>
+
+        <div class="stephead mt"><b>条件删除（高级）</b>
+          <span class="stepnote">按条件批量清理本地日志，无需先搜索勾选。JSON 条件，字段：
+            <code>q</code>(关键字) · <code>action</code> · <code>table_id</code> ·
+            <code>record_id</code> · <code>from</code>/<code>to</code>(YYYY-MM-DD [HH:MM])</span></div>
+        <div class="grid">
+          <label class="fld grow"><span>条件 JSON</span>
+            <input id="auditCondIn" type="text" spellcheck="false"
+              placeholder='例如 {"action":"record_edited","to":"2026-09-03"}' autocomplete="off" /></label>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditCondPreviewBtn" class="mini">预览命中</button></div>
+          <div class="fld go"><span>&nbsp;</span>
+            <button id="auditCondDelBtn" class="mini danger" disabled>按条件删除</button></div>
+        </div>
+        <div class="tip" id="auditCondTip">先预览命中数，确认后再删除；空条件会被服务端拒绝。
+          只清理本地日志，不影响飞书数据。</div>
+
+        <details class="helpbox" id="auditHelp">
+          <summary>📖 使用指南与示例（点击展开）</summary>
+          <div class="hb">
+            <span class="sec">🔍 典型调查流程</span>
+            ① 发现异常（某柜某路线的记录不见了）→ ② 在上方关键字框输入线索
+            （柜号 / 批次号 / 路线，<b>空格分隔 = 同时满足</b>，如
+            <code>BEAU6279991 YVR4</code>）→ ③ 点击结果行展开，查看被删记录的
+            <b>全部字段内容</b>、操作人与时间 → ④ 遇到没解析出来的
+            <code>opt…</code> 值，粘到「ID 解析」框回车。
+
+            <span class="sec">🧹 条件删除 — 字段说明</span>
+            条件是一个 JSON 对象，可用键（全部可组合，同时满足才删）：
+            <code>q</code> 关键字（空格=且，等同搜索框）·
+            <code>action</code>（<code>record_deleted</code> /
+            <code>record_added</code> / <code>record_edited</code>）·
+            <code>table_id</code>（tbl 开头，表下拉框里可查）·
+            <code>record_id</code> ·
+            <code>from</code>/<code>to</code>（含当天，
+            <code>YYYY-MM-DD</code> 或 <code>YYYY-MM-DD HH:MM</code>）
+
+            <span class="sec">⚡ 示例（点「填入」即可开始）</span>
+            <div class="ex"><code>{"action":"record_edited"}</code>
+              <span class="exnote">清掉旧策略时期的全部编辑事件</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"action":"record_edited"}'>填入</button></div>
+            <div class="ex"><code>{"to":"2026-08-31"}</code>
+              <span class="exnote">删除 8 月底（含）之前的所有日志</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"to":"2026-08-31"}'>填入</button></div>
+            <div class="ex"><code>{"to":"…30 天前…"}</code>
+              <span class="exnote">只保留最近 30 天（日期自动计算）</span>
+              <button class="mini exfill" type="button" data-dyn="keep30">填入</button></div>
+            <div class="ex"><code>{"q":"BEAU6279991"}</code>
+              <span class="exnote">清掉某个柜号的全部日志</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"q":"BEAU6279991"}'>填入</button></div>
+            <div class="ex"><code>{"action":"record_added","table_id":"tblbJiIHMwND2OGX","from":"2026-09-01","to":"2026-09-03"}</code>
+              <span class="exnote">3.1 表某日期段的新增事件</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"action":"record_added","table_id":"tblbJiIHMwND2OGX","from":"2026-09-01","to":"2026-09-03"}'>填入</button></div>
+            <div class="ex"><code>{"q":"yvr4 2026-LY","action":"record_deleted"}</code>
+              <span class="exnote">关键字组合 + 只删删除事件</span>
+              <button class="mini exfill" type="button"
+                data-cond='{"q":"yvr4 2026-LY","action":"record_deleted"}'>填入</button></div>
+
+            <div class="hbnote">流程恒定：<b>填条件 → 预览命中 → 按条件删除</b>
+              （改动条件后必须重新预览才能删）。只动本地 logs/audit.db，绝不碰
+              飞书表格；删完自动 VACUUM 释放磁盘。空条件 = 全库删除，会被拒绝 —
+              真要清空就用 <code>{"from":"2000-01-01"}</code> 明确表达。</div>
+
+            <span class="sec">🔤 ID 解析框</span>
+            支持四种前缀：<code>opt…</code> 单选/多选选项值（跨表检索，标注
+            来源表·字段）· <code>fld…</code> 字段 id · <code>tbl…</code> 表 id ·
+            <code>ou_…</code> 操作人。服务启动后台预热索引，冷启动最初 1-2 分钟
+            首次解析会等待；跨 Base 公式带出的 opt 值无法解析。操作人识别不到时
+            先点「🔄 采集操作人名单」再试。
+          </div>
+        </details>
+      </section>
+
+      <section id="auditStatus" class="status" hidden></section>
+      <section id="auditResults" class="results"></section>
+
+      <div class="execbar" id="auditDelBar" hidden>
+        <label class="chkall"><input type="checkbox" id="chkAllAud" /> 全选命中日志</label>
+        <button id="auditDelBtn" class="primary danger" disabled>删除选中日志</button>
+        <span class="tip">只清理<b>本地审计库</b>，不影响飞书表格数据；删除后自动
+          VACUUM 释放磁盘空间。不可恢复。</span>
+      </div>
+    </section>
+
+    <!-- ═══════════════ 库存查询（原查询台） ═══════════════ -->
+    <section id="tab-query" class="tabpane" hidden>
+      <section class="panel controls">
+        <div class="grid">
+          <label class="fld">
+            <span>表</span>
+            <select id="tableSel"></select>
+          </label>
+
+          <label class="fld grow">
+            <span>视图 <em id="viewCount"></em></span>
+            <div class="viewpick">
+              <input id="viewFilter" type="text" placeholder="输入关键字过滤视图…" autocomplete="off" />
+              <select id="viewSel"></select>
+            </div>
+          </label>
+        </div>
+
+        <div class="grid">
+          <label class="fld">
+            <span>查询字段</span>
+            <div class="seg" id="fieldSeg">
+              <button data-k="awb" class="on">柜号/AWB</button>
+              <button data-k="isa">ISA</button>
+            </div>
+          </label>
+
+          <label class="fld">
+            <span>匹配方式</span>
+            <div class="seg" id="modeSeg">
+              <button data-m="contains" class="on">包含</button>
+              <button data-m="is">精确</button>
+            </div>
+          </label>
+
+          <label class="fld grow">
+            <span id="valLabel">柜号</span>
+            <input id="valInput" type="text" placeholder="例如 CAJU5283296" autocomplete="off" />
+          </label>
+
+          <div class="fld go">
+            <span>&nbsp;</span>
+            <button id="goBtn" class="primary">查询</button>
+          </div>
+        </div>
+        <div class="tip" id="modeTip"></div>
+      </section>
+
+      <section id="status" class="status" hidden></section>
+      <section id="results" class="results"></section>
+    </section>
+
+    <!-- ═══════════════ 文件解析（只读：解析后交给 ①/②） ═══════════════ -->
+    <section id="tab-upload" class="tabpane" hidden>
+      <section class="panel upload">
+        <div class="uphead">
+          <b>📄 上传文件自动识别</b>
+          <span>从 Excel / CSV 中自动提取 柜号 · 批次号 · 仓库供应商 · 目的地路线 · 预约时间 · ISA（缺失返回 <code>Null</code>）</span>
+        </div>
+        <div class="ownnote">本页<b>只解析、不写入</b>。识别结果用下方按钮送到
+          「① 新建预约」或「② 计划同步」，由那两页统一执行写入 —— 避免多个入口
+          重复写同一张表。</div>
+        <div id="drop" class="drop">
+          <input id="fileInput" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt" hidden />
+          <div class="dropinner">
+            <span class="big">把文件拖到这里</span>
+            <span class="or">或</span>
+            <button id="pickBtn" class="primary">选择文件</button>
+            <span class="fmt">支持 .xlsx / .xlsm / .csv / .tsv / .txt</span>
+          </div>
+        </div>
+        <div id="parseOut" class="parseout" hidden></div>
+      </section>
+    </section>
+
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
